@@ -6,7 +6,8 @@
 # 流程：
 # 1. 读取比赛数据（+ 可选：原始 Invistico 航空公司满意度数据集作为补充训练样本）
 # 2. 特征工程：服务评分聚合、延误结构、类别交叉、分箱
-# 3. LightGBM / XGBoost 双模型 5 折 CV（同一套折划分；CatBoost 默认关闭，见 `USE_CATBOOST`）
+# 3. LightGBM 两套参数 + 带类别嵌入的 MLP，同一套 10 折 CV（`lgb_a` / `lgb_b` / `nn`）
+#    CatBoost 与 XGBoost 有实现但默认关闭（`USE_CATBOOST` / `USE_XGB`），原因见 README 实验记录
 # 4. 按 OOF AUC 在概率单纯形上搜索融合权重
 # 5. 输出 `submission.csv` + `metrics.json`
 #
@@ -35,7 +36,7 @@ RUN_MODE = "full"          # "full" = 全部数据 + 5 折；"smoke" = 抽样 + 
 USE_ORIGINAL_DATA = False
 # CatBoost 5 折要跑 2.1 小时，且 OOF 比 LightGBM 低 0.0003，融合只 +0.0001
 USE_CATBOOST = False
-N_SPLITS = 5 if RUN_MODE == "full" else 2
+N_SPLITS = 10 if RUN_MODE == "full" else 2
 SMOKE_ROWS = 50_000
 
 TARGET = "satisfaction"
@@ -246,50 +247,81 @@ print(f"X: {X.shape} (synthetic {n_syn} + extra {len(EXTRA_IDX)})  X_test: {X_te
 print(f"positive rate: {y.mean():.4f}")
 
 # %% [markdown]
-# ## 3. 三个模型 × 5 折 CV
+# ## 3. 三个模型 × 10 折 CV
 #
 # 折划分只在比赛训练集上做；补充数据整体并入每个 fold 的训练集，因此 OOF AUC 仍然可比。
+# LightGBM 跑两套参数（一套偏保守、一套更细分）来制造分歧，XGBoost 提供跨库多样性，
+# 最后用贪心集成选择（Caruana）在 OOF 上挑权重——比在单纯形上网格搜索更省评估、更稳。
 
 # %%
 import lightgbm as lgb
 
-LGB_ROUNDS = 5000 if RUN_MODE == "full" else 200
+LGB_ROUNDS = 6000 if RUN_MODE == "full" else 200
+# 每折内多个 seed 平均：标签有噪声时，这是最直接的方差削减手段
+SEEDS_LGB_A = 1 if RUN_MODE == "full" else 1
+SEEDS_LGB_B = 2 if RUN_MODE == "full" else 1
+USE_XGB = False   # v4 实测权重只有 0.03，去掉它把运行时间留给 NN
 
 
-def fit_lgb(tr_idx: np.ndarray, va_idx: np.ndarray):
-    params = dict(
-        objective="binary",
-        metric="auc",
-        boosting_type="gbdt",
-        learning_rate=0.03,
-        num_leaves=127,
-        min_child_samples=100,
-        feature_fraction=0.65,
-        bagging_fraction=0.85,
-        bagging_freq=1,
-        lambda_l1=0.1,
-        lambda_l2=1.0,
-        max_bin=255,
-        n_jobs=-1,
-        verbosity=-1,
-        seed=SEED,
-    )
-    dtrain = lgb.Dataset(X.iloc[tr_idx], y_full[tr_idx], free_raw_data=True)
-    dvalid = lgb.Dataset(X.iloc[va_idx], y[va_idx], reference=dtrain, free_raw_data=True)
-    model = lgb.train(
-        params,
-        dtrain,
-        num_boost_round=LGB_ROUNDS,
-        valid_sets=[dvalid],
-        callbacks=[lgb.early_stopping(250, verbose=False), lgb.log_evaluation(0)],
-    )
-    gain = pd.Series(model.feature_importance("gain"), index=FEATURE_COLS)
-    return (
-        model.predict(X.iloc[va_idx], num_iteration=model.best_iteration),
-        model.predict(X_test, num_iteration=model.best_iteration),
-        gain,
-        model.best_iteration,
-    )
+def make_lgb_fit(params: dict, seeds: int):
+    def fit(tr_idx: np.ndarray, va_idx: np.ndarray):
+        dtrain = lgb.Dataset(X.iloc[tr_idx], y_full[tr_idx], free_raw_data=True)
+        dvalid = lgb.Dataset(X.iloc[va_idx], y[va_idx], reference=dtrain, free_raw_data=True)
+
+        p_va = np.zeros(len(va_idx))
+        p_te = np.zeros(len(X_test))
+        gain = pd.Series(0.0, index=FEATURE_COLS)
+        iters = []
+        for s in range(seeds):
+            seed = SEED + 17 * s
+            model = lgb.train(
+                {**params, "seed": seed, "bagging_seed": seed, "feature_fraction_seed": seed},
+                dtrain,
+                num_boost_round=LGB_ROUNDS,
+                valid_sets=[dvalid],
+                callbacks=[lgb.early_stopping(250, verbose=False), lgb.log_evaluation(0)],
+            )
+            p_va += model.predict(X.iloc[va_idx], num_iteration=model.best_iteration) / seeds
+            p_te += model.predict(X_test, num_iteration=model.best_iteration) / seeds
+            gain += pd.Series(model.feature_importance("gain"), index=FEATURE_COLS) / seeds
+            iters.append(model.best_iteration)
+        return p_va, p_te, gain, int(np.mean(iters))
+
+    return fit
+
+
+LGB_A_PARAMS = dict(
+    objective="binary",
+    metric="auc",
+    boosting_type="gbdt",
+    learning_rate=0.03,
+    num_leaves=127,
+    min_child_samples=100,
+    feature_fraction=0.65,
+    bagging_fraction=0.85,
+    bagging_freq=1,
+    lambda_l1=0.1,
+    lambda_l2=1.0,
+    max_bin=255,
+    n_jobs=-1,
+    verbosity=-1,
+)
+LGB_B_PARAMS = dict(
+    objective="binary",
+    metric="auc",
+    boosting_type="gbdt",
+    learning_rate=0.02,
+    num_leaves=255,
+    min_child_samples=250,
+    feature_fraction=0.45,
+    bagging_fraction=0.75,
+    bagging_freq=1,
+    lambda_l1=0.5,
+    lambda_l2=3.0,
+    max_bin=511,
+    n_jobs=-1,
+    verbosity=-1,
+)
 
 
 import xgboost as xgb
@@ -370,6 +402,112 @@ def fit_catboost(tr_idx: np.ndarray, va_idx: np.ndarray):
     )
 
 
+# ---------------------------------------------------------------- neural net ----
+# 带类别嵌入的 MLP。GBDT 在 13 个有序评分的高阶组合上表达力有限，NN 擅长这类交互，
+# 两者分歧大，融合价值高于再堆一个 GBDT。无 GPU 时自动跳过（本地 smoke 即如此）。
+USE_NN = True
+NN_EPOCHS = 18 if RUN_MODE == "full" else 2
+NN_BATCH = 4096
+NN_LR = 2e-3
+
+
+def make_nn_fit():
+    import torch
+    from torch import nn
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cat_cols = [c for c in FEATURE_COLS if str(X[c].dtype) == "category"]
+    num_cols = [c for c in FEATURE_COLS if c not in cat_cols]
+    # 类别编码直接取 category dtype 的 codes，训练/推理天然对齐
+    xc = np.stack([X[c].cat.codes.to_numpy() for c in cat_cols], axis=1).astype(np.int64)
+    xc_test = np.stack([X_test[c].cat.codes.to_numpy() for c in cat_cols], axis=1).astype(np.int64)
+    cards = [int(X[c].cat.categories.size) for c in cat_cols]
+    xn = X[num_cols].astype("float32").to_numpy()
+    xn_test = X_test[num_cols].astype("float32").to_numpy()
+    print(f"[nn] device={device}  cat_features={len(cat_cols)}  num_features={len(num_cols)}")
+
+    class TabMLP(nn.Module):
+        def __init__(self, cards: list[int], n_num: int, hidden=(512, 256, 128), dropout=0.2):
+            super().__init__()
+            self.embs = nn.ModuleList([nn.Embedding(c, min(16, max(2, (c + 1) // 2))) for c in cards])
+            dim = sum(e.embedding_dim for e in self.embs) + n_num
+            layers: list[nn.Module] = []
+            for h in hidden:
+                layers += [nn.Linear(dim, h), nn.BatchNorm1d(h), nn.GELU(), nn.Dropout(dropout)]
+                dim = h
+            layers.append(nn.Linear(dim, 1))
+            self.mlp = nn.Sequential(*layers)
+
+        def forward(self, x_cat, x_num):
+            e = torch.cat([emb(x_cat[:, i]) for i, emb in enumerate(self.embs)], dim=1)
+            return self.mlp(torch.cat([e, x_num], dim=1)).squeeze(1)
+
+    def predict(model, xc_arr, xn_arr, bs: int = 16384) -> np.ndarray:
+        model.eval()
+        out = np.empty(len(xc_arr), dtype=np.float32)
+        with torch.no_grad():
+            for i in range(0, len(xc_arr), bs):
+                xb = torch.from_numpy(xc_arr[i : i + bs]).to(device)
+                nb = torch.from_numpy(xn_arr[i : i + bs]).to(device)
+                out[i : i + bs] = torch.sigmoid(model(xb, nb)).cpu().numpy()
+        return out
+
+    def fit(tr_idx: np.ndarray, va_idx: np.ndarray):
+        # 数值特征按训练折统计量标准化；Arrival Delay 有缺失，NN 不吃 NaN，
+        # 标准化后按 0 填充（等价于用训练折均值填补，缺失本身已有 flag 特征表达）
+        mu = np.nanmean(xn[tr_idx], axis=0)
+        sd = np.nanstd(xn[tr_idx], axis=0) + 1e-6
+
+        def scale(a: np.ndarray) -> np.ndarray:
+            return np.nan_to_num((a - mu) / sd, nan=0.0, posinf=0.0, neginf=0.0).astype("float32")
+
+        xn_tr = scale(xn[tr_idx])
+        xn_va = scale(xn[va_idx])
+        xn_te = scale(xn_test)
+
+        model = TabMLP(cards, len(num_cols)).to(device)
+        opt = torch.optim.AdamW(model.parameters(), lr=NN_LR, weight_decay=1e-4)
+        steps = int(np.ceil(len(tr_idx) / NN_BATCH))
+        sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=NN_LR, total_steps=NN_EPOCHS * steps)
+        loss_fn = torch.nn.BCEWithLogitsLoss()
+
+        xc_tr = torch.from_numpy(xc[tr_idx]).to(device)
+        y_tr = torch.from_numpy(y_full[tr_idx].astype("float32")).to(device)
+        xn_tr_t = torch.from_numpy(xn_tr).to(device)
+
+        best_auc, best_state, bad = -1.0, None, 0
+        for epoch in range(NN_EPOCHS):
+            model.train()
+            # 索引张量必须和训练张量同设备，否则 GPU 上会报
+            # "indices should be either on cpu or on the same device as the indexed tensor"
+            perm = torch.randperm(len(tr_idx), device=device)
+            for i in range(0, len(tr_idx), NN_BATCH):
+                idx = perm[i : i + NN_BATCH]
+                opt.zero_grad()
+                logits = model(xc_tr[idx], xn_tr_t[idx])
+                loss = loss_fn(logits, y_tr[idx])
+                loss.backward()
+                opt.step()
+                sched.step()
+
+            va_pred = predict(model, xc[va_idx], xn_va.astype("float32"))
+            auc = roc_auc_score(y[va_idx], va_pred)
+            if auc > best_auc:
+                best_auc, bad = auc, 0
+                best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            else:
+                bad += 1
+                if bad >= 4:
+                    break
+
+        model.load_state_dict(best_state)
+        p_va = predict(model, xc[va_idx], xn_va.astype("float32"))
+        p_te = predict(model, xc_test, xn_te)
+        return p_va, p_te, pd.Series(0.0, index=FEATURE_COLS), NN_EPOCHS
+
+    return fit
+
+
 def run_cv(name: str, fit_fn) -> tuple[np.ndarray, np.ndarray, float, pd.Series]:
     oof = np.zeros(n_syn)
     pred = np.zeros(len(X_test))
@@ -396,20 +534,31 @@ for tr_idx, va_idx in skf.split(np.zeros(n_syn), y):
 print(f"{len(folds)} folds, train sizes: {[len(t) for t, _ in folds]}")
 
 results: dict[str, dict] = {}
-results["lgb"] = dict(zip(("oof", "pred", "auc", "gain"), run_cv("lgb", fit_lgb)))
-results["xgb"] = dict(zip(("oof", "pred", "auc", "gain"), run_cv("xgb", fit_xgb)))
+keys = ("oof", "pred", "auc", "gain")
+results["lgb_a"] = dict(zip(keys, run_cv("lgb_a", make_lgb_fit(LGB_A_PARAMS, SEEDS_LGB_A))))
+results["lgb_b"] = dict(zip(keys, run_cv("lgb_b", make_lgb_fit(LGB_B_PARAMS, SEEDS_LGB_B))))
+
+if USE_XGB:
+    results["xgb"] = dict(zip(keys, run_cv("xgb", fit_xgb)))
 
 if USE_CATBOOST:
     try:
-        results["cat"] = dict(zip(("oof", "pred", "auc", "gain"), run_cv("cat", fit_catboost)))
+        results["cat"] = dict(zip(keys, run_cv("cat", fit_catboost)))
     except Exception as exc:  # CatBoost 未安装或不兼容时不让整次运行失败
         print(f"[warn] CatBoost skipped: {type(exc).__name__}: {exc}")
 
+if USE_NN:
+    try:
+        results["nn"] = dict(zip(keys, run_cv("nn", make_nn_fit())))
+    except Exception as exc:  # 没有 torch / 没有 CUDA 时不让整次运行失败
+        print(f"[warn] NN skipped: {type(exc).__name__}: {exc}")
+
 # %% [markdown]
-# ## 4. 融合
+# ## 4. 贪心集成
 #
-# 不同模型的分数尺度不同，先转成 rank，再在概率单纯形上以 0.05 步长搜索权重。
-# 单模型已经最优时直接采用单模型。
+# 先把各模型预测转 rank（消除尺度差异），再做 Caruana 贪心选择：每轮挑一个能让 OOF AUC
+# 提升最多的模型加入平均，重复 MAX_STEPS 轮（允许重复选同一个模型，等价于给它更大权重）。
+# 最终取历史上最好的那一轮；若单模型始终最优，就退化为单模型。
 
 # %%
 from scipy.stats import rankdata
@@ -418,43 +567,40 @@ names = list(results)
 oof_rank = {k: rankdata(results[k]["oof"]) / n_syn for k in names}
 test_rank = {k: rankdata(results[k]["pred"]) / len(X_test) for k in names}
 
-best_weights, best_auc = None, -1.0
-
-
-def simplex_weights(n: int, step: float = 0.05):
-    """生成 n 个非负、和为 1 的权重组合（步长 step）。"""
-    levels = np.arange(0.0, 1.0001, step)
-
-    def rec(prefix: list[float], remaining: float):
-        if len(prefix) == n - 1:
-            yield tuple(prefix + [max(remaining, 0.0)])
-            return
-        for w in levels:
-            if w > remaining + 1e-9:
-                break
-            yield from rec(prefix + [float(w)], remaining - w)
-
-    yield from rec([], 1.0)
-
-
-for weights in simplex_weights(len(names)):
-    blend = sum(w * oof_rank[k] for w, k in zip(weights, names))
-    auc = roc_auc_score(y, blend)
-    if auc > best_auc:
-        best_weights, best_auc = weights, auc
-
 print("model OOF AUC:", {k: round(results[k]["auc"], 6) for k in names})
-print("best blend:", {k: round(w, 2) for k, w in zip(names, best_weights)}, f"-> OOF AUC={best_auc:.6f}")
 
+MAX_STEPS = 30
 best_single = max(names, key=lambda k: results[k]["auc"])
-if results[best_single]["auc"] >= best_auc - 1e-9:
-    print(f"-> using single model: {best_single}")
-    final_test = results[best_single]["pred"]
-    final_oof = results[best_single]["oof"]
+best_weights = {k: 1.0 if k == best_single else 0.0 for k in names}
+best_auc = results[best_single]["auc"]
+print(f"start from best single: {best_single} ({best_auc:.6f})")
+
+running = np.zeros(n_syn)
+picked: list[str] = []
+for step in range(1, MAX_STEPS + 1):
+    scores = {}
+    for k in names:
+        scores[k] = roc_auc_score(y, (running * (step - 1) + oof_rank[k]) / step)
+    k_best = max(scores, key=scores.get)
+    running = (running * (step - 1) + oof_rank[k_best]) / step
+    picked.append(k_best)
+    if scores[k_best] > best_auc + 1e-7:
+        counts = {k: picked.count(k) for k in names}
+        best_weights = {k: counts[k] / step for k in names}
+        best_auc = scores[k_best]
+
+chosen = {k: round(w, 3) for k, w in best_weights.items() if w > 0}
+print("greedy blend:", chosen, f"-> OOF AUC={best_auc:.6f}")
+
+if len(chosen) == 1:
+    only = next(iter(chosen))
+    print(f"-> using single model: {only}")
+    final_test = results[only]["pred"]
+    final_oof = results[only]["oof"]
 else:
-    print("-> using weighted blend")
-    final_test = sum(w * test_rank[k] for w, k in zip(best_weights, names))
-    final_oof = sum(w * oof_rank[k] for w, k in zip(best_weights, names))
+    print("-> using greedy blend")
+    final_test = sum(w * test_rank[k] for k, w in best_weights.items())
+    final_oof = sum(w * oof_rank[k] for k, w in best_weights.items())
 
 final_auc = roc_auc_score(y, final_oof)
 print(f"final OOF AUC = {final_auc:.6f}")
@@ -484,10 +630,12 @@ print(submission.head())
 metrics = {
     "final_oof_auc": final_auc,
     "model_oof_auc": {k: results[k]["auc"] for k in names},
-    "blend_weights": dict(zip(names, [float(w) for w in best_weights])),
+    "blend_weights": {k: float(w) for k, w in best_weights.items()},
     "n_features": len(FEATURE_COLS),
     "n_train": int(n_syn),
     "n_extra": int(len(EXTRA_IDX)),
+    "n_splits": N_SPLITS,
+    "seeds": {"lgb_a": SEEDS_LGB_A, "lgb_b": SEEDS_LGB_B},
 }
 (OUT_DIR / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 print(json.dumps(metrics, indent=2))
@@ -495,8 +643,8 @@ print(json.dumps(metrics, indent=2))
 # %% [markdown]
 # ## 6. 后续可尝试的方向
 #
-# - 10 折 + 多 seed 平均（OOF 方差下降后，融合权重更可信）
-# - 用 OOF 预测做二级 stacking（LogisticRegression / 浅层 LGBM），通常再 +0.0005 左右
-# - `Online boarding` 与 `service_n_zero` 的交互、按 `Class` 分层的目标编码
-# - 调 `num_leaves` / `min_child_samples` 与 `feature_fraction`，本例对这三者最敏感
-# - 若 CV 与 LB 差距持续，检查是否有分布偏移（合成数据的 test 采样方式）
+# - 二级 stacking：把三个模型的 OOF 当成特征训 LogisticRegression，通常比手工权重再 +0.0003 左右
+# - `rank:pairwise` 作为 XGBoost 目标函数，直接优化排序指标而非 logloss
+# - 目标编码 `class_travel`（CV 内拟合，防泄漏），检验显式交叉是否还有剩余信息
+# - 目前瓶颈是标签噪声（见 README 的跨域诊断），继续加特征/加模型的边际收益很低；
+#   若要显著提升，需要换问题设定（比如把 test 的 OOF 伪标签纳入训练）

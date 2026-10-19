@@ -40,21 +40,29 @@ outputs/                            Kaggle 产出与日志（gitignore）
    - 分组体验：数字渠道（WiFi、在线订票、在线登机）与舒适度（座椅、腿部空间、清洁、餐食）
    - 延误结构：到达延误缺失标记、总延误、延误差、是否延误、对数
    - 交互与分箱：`Class × Type of Travel`、`Customer Type × Class`、`Gender × Type of Travel`、年龄 / 距离 / 延误分箱
-2. **双模型，同一套 5 折 StratifiedKFold**：LightGBM（`num_leaves=127`, `lr=0.03`, `ff=0.65`）、XGBoost（`depth=8`, `lr=0.04`）。CatBoost 有实现但默认关闭（`USE_CATBOOST`），原因见实验记录
+2. **三个模型配置，同一套 10 折 StratifiedKFold**
+   - `lgb_a`：`num_leaves=127`、`lr=0.03`、`ff=0.65`，每折内 2 个 seed 平均
+   - `lgb_b`：`num_leaves=255`、`lr=0.02`、`ff=0.45`、`min_child_samples=250`，制造分歧
+   - `xgb`：`depth=8`、`lr=0.04`，提供跨库多样性
+   - CatBoost 有实现但默认关闭（`USE_CATBOOST`），原因见实验记录
 3. **补充训练数据**：可选叠加原始 Invistico 数据集（`teejmahal20/airline-passenger-satisfaction`）。只进入训练集、不参与验证，因此 OOF AUC 仍可比；实测无增益，默认关闭（`USE_ORIGINAL_DATA`）
-4. **融合**：各模型预测先转 rank，在概率单纯形上以 0.05 步长搜权重；单模型更优时直接用单模型
+4. **融合**：各模型预测先转 rank，再用 Caruana 贪心选择（每轮加一个让 OOF AUC 涨最多的模型，最多 30 轮，允许重复）；单模型最优时退化为单模型
 5. **提交**：`id, satisfaction`，概率在 [0,1]
 
 ## 运行记录
 
-| 版本 | 模型 | 特征数 | 补充数据 | OOF AUC | 公开 LB |
-|---|---|---|---|---|---|
-| v1 | LGB + XGB | 41 | 否 | 0.958957 | **0.95846** |
-| v2 | LGB + XGB + CatBoost | 47 | 是 | 0.958846 | — |
-| v3（当前默认） | LGB + XGB（v1 参数） | 47 | 否 | 0.958884 | — |
+| 版本 | 模型 | 折数 / seed | 特征数 | 补充数据 | OOF AUC | 公开 LB |
+|---|---|---|---|---|---|---|
+| v1 | LGB + XGB | 5 / 1 | 41 | 否 | 0.958957 | **0.95846** |
+| v2 | LGB + XGB + CatBoost | 5 / 1 | 47 | 是 | 0.958846 | — |
+| v3 | LGB + XGB（v1 参数） | 5 / 1 | 47 | 否 | 0.958884 | 0.95834 |
+| v4 | `lgb_a` + `lgb_b` + `xgb`，贪心集成 | 10 / 2 | 47 | 否 | 0.959238 | 0.95845 |
+| v5（当前默认） | `lgb_a` + `lgb_b` + `nn`（GPU） | 10 / 1-2 | 47 | 否 | 见 `outputs/metrics.json` | — |
 
 v2 相对 v1 掉 0.0001（噪声量级），但 CatBoost 5 折单吃掉 2.1 小时、自身 OOF 只有 0.958439。
 因此 v3 把 CatBoost 与外部数据都做成默认关闭的开关；v3 与 v1 的 0.00007 差同样在噪声内，说明这 6 个新增特征没有实质贡献。
+v4 换 10 折 + 折内 seed 平均 + 贪心集成，CV 提升 0.00028（0.95896 → 0.95924），**但 LB 完全没动**（0.95846 → 0.95845）。
+这说明 GBDT 侧的方差削减已经无法转化为测试集收益，瓶颈在模型族本身——因此 v5 引入带类别嵌入的 MLP（`nn`），靠模型分歧而不是更多轮数来提升。
 
 ## 诊断：这题的天花板在哪
 
