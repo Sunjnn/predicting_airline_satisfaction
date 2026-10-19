@@ -1,0 +1,99 @@
+# Predicting Airline Satisfaction — playground-series-s6e10
+
+Kaggle Playground S6E10：二分类，预测乘客是否满意（`satisfaction`），提交概率，按 ROC AUC 评估。
+train 699,635 行 / test 299,844 行 / 22 列原始特征。
+
+**训练全部在 Kaggle Notebook 上执行**；本地只负责生成 notebook、跑 smoke 验证、取回结果。
+
+## 目录
+
+```
+src/airline_satisfaction.py         notebook 源文件（percent 格式，同时也是可直接执行的 .py）
+src/make_notebook.py                生成 kaggle/airline_satisfaction.ipynb（顺带语法检查每个 code cell）
+src/smoke_check.py                  本地 5 万行抽样跑通全流程，不训练全量
+src/exp_domain.py                   跨域诊断：原始数据 vs 合成数据（需先下载原始数据集，见下）
+kaggle/kernel-metadata.json         kernel 配置（私有 CPU；比赛数据 + 原始数据集两个来源）
+kaggle/airline_satisfaction.ipynb   生成物，push 的实际内容
+data/                               本地原始数据（gitignore）
+outputs/                            Kaggle 产出与日志（gitignore）
+```
+
+## 在 Kaggle 上跑
+
+```powershell
+.\.venv\Scripts\python.exe src\make_notebook.py          # 改了 .py 必须重新生成 ipynb
+.\.venv\Scripts\kaggle.exe kernels push -p kaggle
+.\.venv\Scripts\kaggle.exe kernels status jianansun/predicting-airline-satisfaction
+.\.venv\Scripts\kaggle.exe kernels output jianansun/predicting-airline-satisfaction -p outputs
+```
+
+产出落在 `outputs/`：`submission.csv`、`metrics.json`、运行日志。提交成绩：
+
+```powershell
+.\.venv\Scripts\kaggle.exe competitions submit -c playground-series-s6e10 -f outputs\submission.csv -m "lgb+xgb blend"
+```
+
+## 模型结构
+
+1. **特征工程**（22 → 47 列）
+   - 13 个服务评分的均值 / 标准差 / 极值 / 0、4、5 的计数 / 0 的占比
+   - 分组体验：数字渠道（WiFi、在线订票、在线登机）与舒适度（座椅、腿部空间、清洁、餐食）
+   - 延误结构：到达延误缺失标记、总延误、延误差、是否延误、对数
+   - 交互与分箱：`Class × Type of Travel`、`Customer Type × Class`、`Gender × Type of Travel`、年龄 / 距离 / 延误分箱
+2. **双模型，同一套 5 折 StratifiedKFold**：LightGBM（`num_leaves=127`, `lr=0.03`, `ff=0.65`）、XGBoost（`depth=8`, `lr=0.04`）。CatBoost 有实现但默认关闭（`USE_CATBOOST`），原因见实验记录
+3. **补充训练数据**：可选叠加原始 Invistico 数据集（`teejmahal20/airline-passenger-satisfaction`）。只进入训练集、不参与验证，因此 OOF AUC 仍可比；实测无增益，默认关闭（`USE_ORIGINAL_DATA`）
+4. **融合**：各模型预测先转 rank，在概率单纯形上以 0.05 步长搜权重；单模型更优时直接用单模型
+5. **提交**：`id, satisfaction`，概率在 [0,1]
+
+## 运行记录
+
+| 版本 | 模型 | 特征数 | 补充数据 | OOF AUC | 公开 LB |
+|---|---|---|---|---|---|
+| v1 | LGB + XGB | 41 | 否 | 0.958957 | **0.95846** |
+| v2 | LGB + XGB + CatBoost | 47 | 是 | 0.958846 | — |
+| v3（当前默认） | LGB + XGB（v1 参数） | 47 | 否 | 0.958884 | — |
+
+v2 相对 v1 掉 0.0001（噪声量级），但 CatBoost 5 折单吃掉 2.1 小时、自身 OOF 只有 0.958439。
+因此 v3 把 CatBoost 与外部数据都做成默认关闭的开关；v3 与 v1 的 0.00007 差同样在噪声内，说明这 6 个新增特征没有实质贡献。
+
+## 诊断：这题的天花板在哪
+
+`src/exp_domain.py` 用同一套小特征 + 短 LightGBM 做跨域对比：
+
+| 训练 → 验证 | AUC |
+|---|---|
+| 原始 Invistico → 合成验证集 | 0.9541 |
+| 合成 → 原始验证集 | **0.9936** |
+| 合成 → 合成验证集（即 CV 参照） | 0.9579 |
+| 原始 + 合成 → 合成验证集 | 0.9580 |
+
+结论：
+
+1. **合成数据由原始数据生成，规则高度可学**——合成训练的模型几乎完美预测原始标签（0.9936）。
+2. **合成标签含噪声**，所以合成内部 AUC 上限就在 0.958–0.96 附近。榜首公开 LB 0.96309 与这个上限一致，说明剩下 0.004 的空间属于"把 P(y|x) 估得更准"，不是找隐藏特征。
+3. **叠加原始数据没有增益**（+0.00003）：它带来的信息已经全在合成数据里了，反而稀释样本权重。
+4. 已排除常见泄漏：训练集内无重复特征向量，测试集与训练集特征向量零重叠，`id` 单独 AUC = 0.5001。
+
+复现诊断需要原始数据集（已 gitignore，需自己下载）：
+
+```powershell
+.\.venv\Scripts\kaggle.exe datasets download -d teejmahal20/airline-passenger-satisfaction -p data\orig --unzip
+.\.venv\Scripts\python.exe src\exp_domain.py
+```
+
+注意该数据集的文件也叫 `train.csv` / `test.csv`，务必解压到 `data\orig\`，否则会覆盖比赛数据。
+
+## 踩过的坑
+
+- **比赛数据挂载路径**：新环境是 `/kaggle/input/competitions/<slug>/`，老教程里写的 `/kaggle/input/<slug>/` 已经不对了。notebook 里 `resolve_competition_dir()` 两种都兼容，并会递归兜底。
+- **中文日志乱码**：Kaggle 日志按本地码页截断，运行期 `print` 全部用英文，中文只留在 markdown cell 里。
+- **jupytext 在本机不可用**：`jupytext`/`nbformat` 会往用户目录写签名状态，被项目沙箱拦住，所以改用 `src/make_notebook.py` 自己解析 percent 格式。
+- **`uv` 缓存目录**：默认缓存在用户目录，沙箱下不可写；本地装包前需要 `$env:UV_CACHE_DIR = "$PWD\.uv-cache"`。
+
+## 待办
+
+- 10 折 + 多 seed 平均：标签有噪声时这是最稳的正收益，能压低 OOF 方差、让融合权重更可信
+- OOF 二级 stacking（LogisticRegression / 浅层 LGBM）
+- 直接优化 AUC 的替代损失（XGBoost `rank:pairwise`），噪声标签下常比 logloss 更贴指标
+- CatBoost 若要重启：把 `iterations` 降到 1200、`depth` 降到 7，单折可压到 10 分钟内
+- 确认赛题是否允许外部数据；即使允许，本例已验证无增益，保持 `USE_ORIGINAL_DATA = False`

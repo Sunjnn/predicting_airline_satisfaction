@@ -1,0 +1,16 @@
+{
+  "id": "jianansun/predicting-airline-satisfaction",
+  "title": "Predicting Airline Satisfaction",
+  "code_file": "airline_satisfaction.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "machine_shape": "",
+  "dataset_sources": ["teejmahal20/airline-passenger-satisfaction"],
+  "competition_sources": ["playground-series-s6e10"],
+  "kernel_sources": [],
+  "model_sources": []
+}

@@ -1,0 +1,10 @@
+# 本地工具链（notebook 生成、smoke 验证、Kaggle CLI）
+# 训练依赖由 Kaggle 镜像提供，无需在本地安装全量环境
+kaggle==2.2.4
+nbformat==5.11.1
+pandas==3.0.6
+numpy==2.5.4
+scikit-learn==1.9.1
+lightgbm==4.7.0
+xgboost==3.4.1
+scipy==1.18.1
