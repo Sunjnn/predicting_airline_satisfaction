@@ -11,7 +11,9 @@
   "machine_shape": "",
   "dataset_sources": [
     "cdeotte/s6e10-tfm-oof-and-test-predictions",
-    "megayak/s6e10-oof-library"
+    "megayak/s6e10-oof-library",
+    "sachith7/s6e10-stack-oof-predictions",
+    "dariushafshar/s6e10-golem-oof-library"
   ],
   "competition_sources": ["playground-series-s6e10"],
   "kernel_sources": [],
