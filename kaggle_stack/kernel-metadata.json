@@ -1,0 +1,19 @@
+{
+  "id": "jianansun/s6e10-public-oof-stack",
+  "title": "S6E10 public OOF stack",
+  "code_file": "airline_stack_public.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "machine_shape": "",
+  "dataset_sources": [
+    "cdeotte/s6e10-tfm-oof-and-test-predictions",
+    "megayak/s6e10-oof-library"
+  ],
+  "competition_sources": ["playground-series-s6e10"],
+  "kernel_sources": [],
+  "model_sources": []
+}

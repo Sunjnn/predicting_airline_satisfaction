@@ -9,6 +9,8 @@
 # | 频次编码 + rarity（`-log(freq)`） | 同上 | OOF +0.00038 |
 # | 目标编码 × 3 种平滑（auto/10/100），折内拟合 | 同上 | OOF +0.00038 |
 # | 原始数据集训练的模型预测值作为特征 | 同上 | — |
+# | 服务评分聚合（均值/离散度/极值/0 与 5 计数） | 本仓库主线模型 | — |
+# | 原始数据按精确键元组查 target rate + 支持度 | 同上（升级版） | — |
 #
 # 单一 LightGBM、5 折，不做融合，方便干净地读出「特征」本身的收益。
 
@@ -117,6 +119,38 @@ for col in DIGIT_COLS:
 print(f"digit features: {len(DIGIT_COLS) * len(list(DIGITS))}  -> train={train.shape}")
 
 # %% [markdown]
+# ## 服务评分聚合
+#
+# 13 个 0–5 评分是同一组「体验」维度，整体水平与离散度本身有信号（主线模型已验证过）。
+
+# %%
+SERVICE_COLS = [
+    "Inflight wifi service",
+    "Departure/Arrival time convenient",
+    "Ease of Online booking",
+    "Gate location",
+    "Food and drink",
+    "Online boarding",
+    "Seat comfort",
+    "Inflight entertainment",
+    "On-board service",
+    "Leg room service",
+    "Baggage handling",
+    "Checkin service",
+    "Cleanliness",
+]
+for df in (train, test):
+    s = df[SERVICE_COLS]
+    df["service_mean"] = s.mean(axis=1).astype("float32")
+    df["service_std"] = s.std(axis=1).astype("float32")
+    df["service_min"] = s.min(axis=1).astype("int8")
+    df["service_max"] = s.max(axis=1).astype("int8")
+    df["service_sum"] = s.sum(axis=1).astype("int16")
+    df["service_n_zero"] = (s == 0).sum(axis=1).astype("int8")
+    df["service_n_five"] = (s == 5).sum(axis=1).astype("int8")
+print(f"service aggregates added -> train={train.shape}")
+
+# %% [markdown]
 # ## 3. 频次编码 + rarity
 #
 # 频次用 train+test 合并统计（无标签，不算泄漏）；rarity = `-log(freq)`。
@@ -220,6 +254,55 @@ else:
     print("[warn] original dataset not found, skipping orig_pred")
 
 # %% [markdown]
+# ## 原始数据的精确键查询
+#
+# 对若干键元组（类别交叉、关键评分组合、13 个评分全组合），在原始数据上统计 target rate 与
+# 支持度，再映射回比赛数据。用的是原始标签、不是合成标签，因此不构成对验证折的泄漏；
+# rate 做 alpha 平滑，避免「只命中 1 条原始记录」时退化成原始标签本身。
+
+# %%
+ORIG_KEY_SPECS = {
+    "class_travel": ["Class", "Type of Travel"],
+    "customer_class": ["Customer Type", "Class"],
+    "travel_gender": ["Type of Travel", "Gender"],
+    "board_wifi": ["Online boarding", "Inflight wifi service"],
+    "seat_clean": ["Seat comfort", "Cleanliness"],
+    "ent_comfort": ["Inflight entertainment", "Seat comfort"],
+    "rating13": SERVICE_COLS,
+    "rating13_seg": SERVICE_COLS + CAT_COLS,
+}
+LOOKUP_ALPHA = 20.0
+
+
+def _frame_key(df: pd.DataFrame, cols: list[str]) -> pd.Series:
+    if len(cols) == 1:
+        return df[cols[0]].astype(str)
+    out = df[cols[0]].astype(str)
+    for c in cols[1:]:
+        out = out.str.cat(df[c].astype(str), sep="|")
+    return out
+
+
+if ORIG_PATH is not None:
+    prior = float(orig[TARGET].mean())
+    added_lookup = []
+    for name, cols in ORIG_KEY_SPECS.items():
+        g = orig.assign(_k=_frame_key(orig, cols)).groupby("_k")[TARGET].agg(["sum", "count"])
+        rate_name = f"orig_{name}_rate"
+        cnt_name = f"orig_{name}_cnt"
+        rate_map = ((g["sum"] + prior * LOOKUP_ALPHA) / (g["count"] + LOOKUP_ALPHA)).astype("float32")
+        cnt_map = np.log1p(g["count"]).astype("float32")
+        for df in (train, test):
+            k = _frame_key(df, cols)
+            df[rate_name] = k.map(rate_map).fillna(prior).astype("float32").to_numpy()
+            df[cnt_name] = k.map(cnt_map).fillna(0.0).astype("float32").to_numpy()
+        added_lookup += [rate_name, cnt_name]
+        print(f"  {name:<16} keys={len(rate_map):>7,}  coverage={train[rate_name].ne(prior).mean():.3f}")
+    print(f"orig lookups added: {len(added_lookup)}  -> train={train.shape}")
+else:
+    print("[warn] original dataset not found, skipping lookups")
+
+# %% [markdown]
 # ## 6. 5 折 CV
 
 # %%
@@ -317,7 +400,7 @@ print(json.dumps(metrics, indent=2))
 # %% [markdown]
 # ## 8. 下一步
 #
-# - 若这套特征把 OOF 推到 0.960+，把它作为主线 notebook 的特征层，再叠 10 折 + 多模型
-# - 还差原作者的两块：原始数据按精确键元组查 target rate、数值列转 category
-# - 注意公开 notebook 的高分有相当部分来自对公开 LB 的曲面拟合（见 `rank16` 那篇），
-#   那类做法在 private LB 上大概率不成立，不作为参考
+# - 特征这套已经跑通（v1 OOF 0.96030 / LB 0.95986），继续加：10 折、多 seed
+# - 与主线 10 折集成（`lgb_a`/`lgb_b`/`nn`）做 stacking——两套特征空间差异大，融合价值高
+# - 公开 OOF 库（`sachith7`、`megayak`、`cdeotte`）可做二级 stacking，公开榜同类做法到 0.9618–0.9620
+# - 公开 notebook 里 0.96207 那类「对公开 LB 做曲面拟合」的分数在 private 上大概率不成立，不作为参考

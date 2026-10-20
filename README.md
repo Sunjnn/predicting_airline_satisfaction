@@ -53,16 +53,20 @@ outputs/                            Kaggle 产出与日志（gitignore）
 
 | 版本 | 模型 | 折数 / seed | 特征数 | 补充数据 | OOF AUC | 公开 LB |
 |---|---|---|---|---|---|---|
-| v1 | LGB + XGB | 5 / 1 | 41 | 否 | 0.958957 | **0.95846** |
+| v1 | LGB + XGB | 5 / 1 | 41 | 否 | 0.958957 | 0.95846 |
 | v2 | LGB + XGB + CatBoost | 5 / 1 | 47 | 是 | 0.958846 | — |
 | v3 | LGB + XGB（v1 参数） | 5 / 1 | 47 | 否 | 0.958884 | 0.95834 |
 | v4 | `lgb_a` + `lgb_b` + `xgb`，贪心集成 | 10 / 2 | 47 | 否 | 0.959238 | 0.95845 |
-| v5（当前默认） | `lgb_a` + `lgb_b` + `nn`（GPU） | 10 / 1-2 | 47 | 否 | 见 `outputs/metrics.json` | — |
+| v5 | `lgb_a` + `lgb_b` + `nn`（GPU） | 10 / 1-2 | 47 | 否 | 0.959289 | 0.95843 |
+| **FE** | LGBM + digit/freq/TE/原始预测 | 5 / 1 | 214 | 原始 | 0.960296 | **0.95986** |
 
 v2 相对 v1 掉 0.0001（噪声量级），但 CatBoost 5 折单吃掉 2.1 小时、自身 OOF 只有 0.958439。
-因此 v3 把 CatBoost 与外部数据都做成默认关闭的开关；v3 与 v1 的 0.00007 差同样在噪声内，说明这 6 个新增特征没有实质贡献。
+因此 v3 把 CatBoost 与外部数据都做成默认关闭的开关；v3 与 v1 的 0.00007 差同样在噪声内，说明那 6 个新增特征没有实质贡献。
 v4 换 10 折 + 折内 seed 平均 + 贪心集成，CV 提升 0.00028（0.95896 → 0.95924），**但 LB 完全没动**（0.95846 → 0.95845）。
-这说明 GBDT 侧的方差削减已经无法转化为测试集收益，瓶颈在模型族本身——因此 v5 引入带类别嵌入的 MLP（`nn`），靠模型分歧而不是更多轮数来提升。
+v5 加入带类别嵌入的 MLP，CV 到 0.959289，LB 仍是 0.95843——GBDT/MLP 这一族做法已经饱和。
+
+**FE 版是分水岭**：换成公开 notebook 验证过的特征组合（digit、频次/rarity、折内目标编码、原始数据先验），
+OOF 直接到 0.960296、LB 到 0.95986，`+0.0014`。所以之前的「天花板」判断是错的——瓶颈在特征，不在模型族。
 
 ## 诊断：这题的天花板在哪
 
@@ -90,6 +94,21 @@ v4 换 10 折 + 折内 seed 平均 + 贪心集成，CV 提升 0.00028（0.95896 
 ```
 
 注意该数据集的文件也叫 `train.csv` / `test.csv`，务必解压到 `data\orig\`，否则会覆盖比赛数据。
+
+## 参考公开方案（用 `kaggle kernels pull` 拉下来读的）
+
+| notebook | 分数 | 关键信息 |
+|---|---|---|
+| [evgendvorkin/s6e10-lightgbm-cv-5-folds-0-96111](https://www.kaggle.com/code/evgendvorkin/s6e10-lightgbm-cv-5-folds-0-96111) | LB 0.96111 | 逐项 ablation：digit +0.00069、频次 +0.00038、TE +0.00038，是真实增量来源 |
+| [yekenot/ps-s6-e10-realmlp-pytabkit](https://www.kaggle.com/code/yekenot/ps-s6-e10-realmlp-pytabkit) | — | `RealMLP_TD_Classifier`（pytabkit）+ 数值全转类别 + count 编码 + 组合键 TE |
+| [cdeotte/stacking-tfms-with-public-oof](https://www.kaggle.com/code/cdeotte/stacking-tfms-with-public-oof) | — | 公开 OOF 库（124 个模型的 OOF/test 对，同一套 5 折）做二级 stacking |
+| [rabari9999/s6e10-lb-0-96207-rank-16](https://www.kaggle.com/code/rabari9999/s6e10-lb-0-96207-rank-16) | LB 0.96207 | **不是模型**：对公开 LB 拟合二次响应面做梯度爬坡；作者自述 private 会掉，不建议学 |
+
+结论：榜上 0.962 里有相当一部分是对公开 LB 的过拟合；能复现的真实提升来自特征（digit / 频次 / TE / 原始数据先验）。
+
+## 工作约定
+
+每次向 LB 提交 `submission.csv` 之前，先把对应代码 commit 掉，保证榜上的分数总能追溯到具体 commit。
 
 ## 踩过的坑
 
