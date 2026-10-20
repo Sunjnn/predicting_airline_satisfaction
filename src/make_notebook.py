@@ -1,6 +1,8 @@
-"""Convert the jupytext percent-format source into a Kaggle-ready .ipynb.
+"""Convert a jupytext percent-format source into a Kaggle-ready .ipynb.
 
-Run: .venv\\Scripts\\python.exe src\\make_notebook.py
+Run:
+  .venv\\Scripts\\python.exe src\\make_notebook.py                  # default notebook
+  .venv\\Scripts\\python.exe src\\make_notebook.py --src src\\foo.py --dst kaggle\\foo.ipynb
 
 Implemented directly instead of shelling out to jupytext: jupytext/nbformat
 writes signature state into the user profile, which the project sandbox blocks.
@@ -9,13 +11,14 @@ every code cell while converting.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src" / "airline_satisfaction.py"
-DST = ROOT / "kaggle" / "airline_satisfaction.ipynb"
+DEFAULT_SRC = ROOT / "src" / "airline_satisfaction.py"
+DEFAULT_DST = ROOT / "kaggle" / "airline_satisfaction.ipynb"
 
 CELL_MARKER = re.compile(r"^#\s*%%(?:\s*\[(?P<kind>\w+)\])?\s*$")
 
@@ -98,16 +101,27 @@ def build_notebook(cells: list[dict]) -> dict:
 
 
 def main() -> int:
-    text = SRC.read_text(encoding="utf-8")
-    cells = parse_cells(text)
-    nb = build_notebook(cells)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--src", default=str(DEFAULT_SRC))
+    ap.add_argument("--dst", default=str(DEFAULT_DST))
+    args = ap.parse_args()
 
-    DST.parent.mkdir(parents=True, exist_ok=True)
-    DST.write_text(json.dumps(nb, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    src = Path(args.src).resolve()
+    dst = Path(args.dst).resolve()
+
+    text = src.read_text(encoding="utf-8")
+    nb = build_notebook(parse_cells(text))
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(json.dumps(nb, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
 
     code_cells = sum(1 for c in nb["cells"] if c["cell_type"] == "code")
     md_cells = sum(1 for c in nb["cells"] if c["cell_type"] == "markdown")
-    print(f"wrote {DST.relative_to(ROOT)}: {len(nb['cells'])} cells ({code_cells} code, {md_cells} markdown)")
+    try:
+        shown = dst.relative_to(ROOT)
+    except ValueError:
+        shown = dst
+    print(f"wrote {shown}: {len(nb['cells'])} cells ({code_cells} code, {md_cells} markdown)")
     return 0
 
 
