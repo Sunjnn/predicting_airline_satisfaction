@@ -128,65 +128,79 @@ print(board.head(12).to_string(index=False))
 print(f"\nmember OOF AUC: min={board.oof_auc.min():.6f} median={board.oof_auc.median():.6f} max={board.oof_auc.max():.6f}")
 
 # %% [markdown]
-# ## 3. 5 折堆叠（LightGBM 二级模型）
+# ## 3. 堆叠
 #
-# 折与成员模型一致（`seed=42`），因此 OOF 与成员可比。同时打印与「成员平均」的对比。
+# 参照实现用**线性** stacker（logits 上做逻辑回归，`C=1.0`）。树模型在这里会过拟合成员的
+# OOF 噪声：实测 LightGBM 二级模型只有 0.9596，反而低于成员平均 0.9615。
+# 因此这里同时算三种口径，按 OOF 取最优：
+#
+# 1. 成员简单平均（logit 域）
+# 2. 逻辑回归堆叠（线性，正则化）
+# 3. 去掉最弱成员后的平均
 
 # %%
+from sklearn.linear_model import LogisticRegression
+
 names = list(members)
 X_oof = np.stack([members[n][0] for n in names], axis=1)
 X_test = np.stack([members[n][1] for n in names], axis=1)
 print(f"stack matrix: {X_oof.shape} / {X_test.shape}")
 
+folds = list(StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED).split(X_oof, y))
+
+# --- 1) 简单平均 -------------------------------------------------------------
 mean_oof = X_oof.mean(axis=1)
-print(f"simple mean of members: OOF AUC = {roc_auc_score(y, mean_oof):.6f}")
+mean_auc = roc_auc_score(y, mean_oof)
+mean_test = X_test.mean(axis=1)
+print(f"[mean]      OOF AUC = {mean_auc:.6f}")
 
-params = dict(
-    objective="binary",
-    metric="auc",
-    learning_rate=0.03,
-    num_leaves=31,
-    min_child_samples=200,
-    feature_fraction=0.7,
-    bagging_fraction=0.9,
-    bagging_freq=1,
-    lambda_l2=5.0,
-    n_jobs=-1,
-    verbosity=-1,
-    seed=SEED,
-)
-skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
-oof = np.zeros(len(y))
-pred = np.zeros(len(test))
-for fold, (tr_idx, va_idx) in enumerate(skf.split(X_oof, y), start=1):
-    model = lgb.train(
-        params,
-        lgb.Dataset(X_oof[tr_idx], y[tr_idx]),
-        num_boost_round=1500,
-        valid_sets=[lgb.Dataset(X_oof[va_idx], y[va_idx])],
-        callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)],
-    )
-    oof[va_idx] = model.predict(X_oof[va_idx], num_iteration=model.best_iteration)
-    pred += model.predict(X_test, num_iteration=model.best_iteration) / N_SPLITS
-    print(f"[fold {fold}] auc={roc_auc_score(y[va_idx], oof[va_idx]):.6f}  iter={model.best_iteration}")
+# --- 2) 逻辑回归堆叠 ---------------------------------------------------------
+lr_oof = np.zeros(len(y))
+lr_pred = np.zeros(len(test))
+for fold, (tr_idx, va_idx) in enumerate(folds, start=1):
+    clf = LogisticRegression(C=1.0, max_iter=1000, solver="lbfgs")
+    clf.fit(X_oof[tr_idx], y[tr_idx])
+    lr_oof[va_idx] = clf.predict_proba(X_oof[va_idx])[:, 1]
+    lr_pred += clf.predict_proba(X_test)[:, 1] / N_SPLITS
+    print(f"[lr] fold {fold} auc={roc_auc_score(y[va_idx], lr_oof[va_idx]):.6f}")
+lr_auc = roc_auc_score(y, lr_oof)
+print(f"[lr]        OOF AUC = {lr_auc:.6f}")
 
-stack_auc = roc_auc_score(y, oof)
-print(f"\nstack OOF AUC = {stack_auc:.6f}")
-print(f"best single   = {board.oof_auc.max():.6f} ({board.iloc[0]['member']})")
+# --- 3) 去掉最弱 1/3 成员后的平均 --------------------------------------------
+keep = board.head(max(1, int(len(board) * 2 / 3)))["member"].tolist()
+idx = [names.index(k) for k in keep if k in names]
+trim_oof = X_oof[:, idx].mean(axis=1)
+trim_auc = roc_auc_score(y, trim_oof)
+trim_test = X_test[:, idx].mean(axis=1)
+print(f"[mean-top]  OOF AUC = {trim_auc:.6f}  (kept {len(idx)}/{len(names)})")
+
+# --- 选择 -------------------------------------------------------------------
+candidates = {
+    "mean": (mean_auc, mean_test),
+    "lr": (lr_auc, lr_pred),
+    "mean_top": (trim_auc, trim_test),
+}
+chosen = max(candidates, key=lambda k: candidates[k][0])
+stack_auc, final_test = candidates[chosen][0], candidates[chosen][1]
+print(f"\nchosen: {chosen}  OOF AUC = {stack_auc:.6f}")
+print(f"best single member = {board.oof_auc.max():.6f} ({board.iloc[0]['member']})")
 
 # %% [markdown]
 # ## 4. 提交文件
 
 # %%
-sub = pd.DataFrame({"id": test_ids, TARGET: np.asarray(pred, dtype=float)})
+sub = pd.DataFrame({"id": test_ids, TARGET: np.asarray(final_test, dtype=float)})
 if len(sub) == len(sample_sub):
     sub.to_csv(OUT / "submission.csv", index=False)
     print(f"wrote {OUT / 'submission.csv'}  rows={len(sub)}")
 print(sub.head())
 
 metrics = {
-    "stack_oof_auc": stack_auc,
-    "mean_member_oof_auc": float(roc_auc_score(y, mean_oof)),
+    "chosen": chosen,
+    "stack_oof_auc": float(stack_auc),
+    "mean_oof_auc": float(mean_auc),
+    "lr_oof_auc": float(lr_auc),
+    "mean_top_oof_auc": float(trim_auc),
     "best_single_oof_auc": float(board.oof_auc.max()),
     "best_single_member": str(board.iloc[0]["member"]),
     "n_members": len(names),
