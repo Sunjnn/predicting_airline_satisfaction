@@ -13,7 +13,10 @@
     "cdeotte/s6e10-tfm-oof-and-test-predictions",
     "megayak/s6e10-oof-library",
     "sachith7/s6e10-stack-oof-predictions",
-    "dariushafshar/s6e10-golem-oof-library"
+    "dariushafshar/s6e10-golem-oof-library",
+    "arhancanli12/s6e10-oof-test-predictions",
+    "goodpjw2008/s6e10-tabpfn-member",
+    "dmitriykolmikov/s6e10-catboost-all-categorical-oof-and-test"
   ],
   "competition_sources": ["playground-series-s6e10"],
   "kernel_sources": [],
