@@ -13,11 +13,15 @@
 # | 原始数据按精确键元组查 target rate + 支持度 | 同上（升级版） | — |
 # | 航线画像：精确距离（× 舱位）上的评分均值与个人偏差 | `kozykappa/s6e10-route-profile-cross-fitted-target` | — |
 # | 航线 ID / 评分 × 乘客分段的折内目标编码 | 同上 | — |
+# | v4：完整航线画像（同一距离下全部原始列的均值 + 行数） | `goodpjw2008/s6e10-auxiliary-task-features` | 单独即达到航线 TE 水平 |
+# | v4：辅助任务特征（用其余 20 列预测每个评分的期望值 + 整行伪对数似然，不用标签） | 同上 | XGB +0.00013 |
+# | v4：LightGBM 改为更强正则（127 叶、`min_child=50`、`ff=0.5`） | 同上 | — |
 #
 # 单一 LightGBM、5 折，不做融合，方便干净地读出「特征」本身的收益。
 
 # %%
 import json
+import shutil
 import time
 import warnings
 from pathlib import Path
@@ -25,6 +29,7 @@ from pathlib import Path
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import xgboost as xgb
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import TargetEncoder
@@ -37,6 +42,8 @@ RUN_MODE = "full"          # "full" | "smoke"
 N_SPLITS = 5
 SMOKE_ROWS = 50_000
 USE_ORIGINAL = True
+USE_AUX = True             # 辅助任务特征（16 个多分类 XGBoost × AUX_FOLDS 折，有 GPU 时用 cuda）
+AUX_FOLDS = 3
 
 TARGET = "satisfaction"
 ID = "id"
@@ -102,6 +109,7 @@ for col in CAT_COLS:
     train[col] = train[col].astype("category")
     test[col] = test[col].astype("category")
 
+RAW_COLS = list(train.columns)
 print(f"base train={train.shape} test={test.shape}  target rate={y.mean():.4f}")
 
 # %% [markdown]
@@ -198,8 +206,73 @@ for key_cols, suffix in [(["Flight Distance"], "route"), (["Flight Distance", "C
     for name, v in feats.items():
         train[name] = v[: len(train)].astype("float32")
         test[name] = v[len(train):].astype("float32")
-del _all
+
+# 完整航线画像：同一距离下其余每个原始列的均值（类别列用整数编码），以及该距离的行数
+_coded = _all[RAW_COLS].copy()
+for col in CAT_COLS:
+    _coded[col] = _coded[col].astype("category").cat.codes
+grp = _coded.groupby("Flight Distance")
+fdm = {f"fdm_{c}": grp[c].transform("mean").to_numpy(dtype="float32") for c in RAW_COLS if c != "Flight Distance"}
+fdm["fd_cnt"] = grp["Age"].transform("size").to_numpy(dtype="float32")
+for name, v in fdm.items():
+    train[name] = v[: len(train)]
+    test[name] = v[len(train):]
+del _all, grp
 print(f"route profile added -> train={train.shape}")
+
+# %% [markdown]
+# ## 辅助任务特征
+#
+# 来自 `goodpjw2008/s6e10-auxiliary-task-features`：对 13 个评分与 3 个类别列，用其余 20 列训练多分类 XGBoost
+# （train+test 合并、K 折，每行由没见过它的模型预测），保留：
+#
+# - `aux_ev_<评分>`：该评分的期望值 Σ k·P(k)，「根据其他回答，这位乘客预期会打几分」
+# - `aux_sum_logp`：16 列实际取值概率的对数和，整行的伪对数似然（「这一行有多典型」）
+#
+# 不用标签，所以和计数、航线画像一样只算一次，不必放进 CV 折内。作者实测期望值单模型 +0.0001；
+# 单列实际取值概率单独用反而有害，这里不加。
+
+# %%
+if USE_AUX:
+    from sklearn.model_selection import KFold
+
+    AUX_DEVICE = "cuda" if shutil.which("nvidia-smi") else "cpu"
+    AUX_ROUNDS = 300 if RUN_MODE == "full" else 30
+    AUX_TARGETS = SERVICE_COLS + ["Class", "Type of Travel", "Customer Type"]
+    _coded = pd.concat([train[RAW_COLS], test[RAW_COLS]], axis=0, ignore_index=True)
+    for col in CAT_COLS:
+        _coded[col] = _coded[col].astype("category").cat.codes
+    aux, logp = {}, np.zeros(len(_coded), dtype=np.float64)
+    t0 = time.time()
+    for c in AUX_TARGETS:
+        yc, uniq = pd.factorize(_coded[c], sort=True)
+        k = len(uniq)
+        others = [f for f in RAW_COLS if f != c]
+        P = np.zeros((len(_coded), k), dtype=np.float32)
+        for a, b in KFold(AUX_FOLDS, shuffle=True, random_state=0).split(_coded):
+            m = xgb.XGBClassifier(
+                n_estimators=AUX_ROUNDS,
+                learning_rate=0.1,
+                max_depth=6,
+                subsample=0.8,
+                colsample_bytree=0.7,
+                tree_method="hist",
+                device=AUX_DEVICE,
+                random_state=0,
+                objective="multi:softprob" if k > 2 else "binary:logistic",
+            )
+            m.fit(_coded.iloc[a][others], yc[a])
+            P[b] = m.predict_proba(_coded.iloc[b][others])
+        logp += np.log(np.clip(P[np.arange(len(_coded)), yc], 1e-6, 1))
+        if c in SERVICE_COLS:
+            aux[f"aux_ev_{c}"] = P @ np.asarray(uniq, dtype=np.float32)
+        print(f"  aux {c:<34} k={k}  acc={(P.argmax(1) == yc).mean():.3f}  ({time.time() - t0:.0f}s)", flush=True)
+    aux["aux_sum_logp"] = logp.astype(np.float32)
+    for name, v in aux.items():
+        train[name] = np.asarray(v[: len(train)], dtype="float32")
+        test[name] = np.asarray(v[len(train):], dtype="float32")
+    del _coded
+    print(f"aux features added: {len(aux)}  device={AUX_DEVICE}  -> train={train.shape}")
 
 # %% [markdown]
 # ## 4. 目标编码的键
@@ -373,14 +446,12 @@ LGB_PARAMS = dict(
     metric="auc",
     boosting_type="gbdt",
     learning_rate=0.02,
-    num_leaves=255,
-    max_depth=8,
-    min_child_samples=5,
-    feature_fraction=0.9,
-    bagging_fraction=0.9,
+    num_leaves=127,
+    min_child_samples=50,
+    feature_fraction=0.5,
+    bagging_fraction=0.8,
     bagging_freq=1,
-    lambda_l2=5.0,
-    lambda_l1=0.05,
+    lambda_l2=1.0,
     n_jobs=-1,
     verbosity=-1,
 )
