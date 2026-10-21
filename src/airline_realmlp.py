@@ -1,0 +1,271 @@
+# %% [markdown]
+# # S6E10 RealMLP + 航线特征（神经网络成员）
+#
+# 堆叠 v5/v6 说明：252 个公开成员里 GBDT 已经饱和，FE v3 再强也只给堆叠 +2e-6。
+# 想继续提分需要不同族的模型。公开的 `yekenot/ps-s6-e10-realmlp-pytabkit`（RealMLP，pytabkit）
+# 单模型 OOF 0.96122，T4 上 9 分钟，是性价比最高的神经网络底座。
+#
+# 本 notebook 同一套 `StratifiedKFold(5, shuffle=True, random_state=42)` 跑两个变体做对照：
+#
+# | 变体 | 特征 |
+# |---|---|
+# | `base` | 复现公开配置：数值列全部转类别（embedding）、count 编码、4 个组合键 + 折内 TE |
+# | `route` | `base` + FE v3 验证过的航线特征：航线画像（精确距离上的评分均值 / 偏差）、航线 × 舱位 / 出行类型与评分 × 乘客分段的折内 TE |
+#
+# 两个变体的 OOF / test 都保存，供堆叠当成员使用。需要 GPU 与联网（`pip install pytabkit`）。
+
+# %%
+import json
+import os
+import random
+import time
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import TargetEncoder
+
+warnings.filterwarnings("ignore")
+
+COMP = "playground-series-s6e10"
+TARGET = "satisfaction"
+ID = "id"
+SEED = 42
+N_SPLITS = 5
+RUN_MODE = "full"          # "full" | "smoke"
+SMOKE_ROWS = 20_000
+VARIANTS = ["base", "route"]
+DRY_RUN = os.environ.get("NN_DRY_RUN") == "1"   # 本地只检查特征工程，不训练
+
+IS_KAGGLE = Path("/kaggle/input").exists()
+OUT_DIR = Path("/kaggle/working") if IS_KAGGLE else Path("outputs/nn")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def resolve_dir() -> Path:
+    if not IS_KAGGLE:
+        return Path("data")
+    for t in Path("/kaggle/input").rglob("train.csv"):
+        if COMP in str(t):
+            return t.parent
+    raise FileNotFoundError("competition train.csv not found")
+
+
+random.seed(SEED)
+np.random.seed(SEED)
+
+DATA_DIR = resolve_dir()
+train = pd.read_csv(DATA_DIR / "train.csv")
+test = pd.read_csv(DATA_DIR / "test.csv")
+if RUN_MODE == "smoke":
+    train = train.sample(SMOKE_ROWS, random_state=SEED).reset_index(drop=True)
+    test = test.head(SMOKE_ROWS // 2).reset_index(drop=True)
+
+y = train[TARGET].astype(int).reset_index(drop=True)
+train_id, test_id = train[ID].to_numpy(), test[ID].to_numpy()
+X_raw = train.drop(columns=[ID, TARGET])
+X_test_raw = test.drop(columns=[ID])
+NTR = len(X_raw)
+print(f"run_mode={RUN_MODE}  data_dir={DATA_DIR}  train={X_raw.shape}  test={X_test_raw.shape}")
+
+# %% [markdown]
+# ## 1. 特征工程
+#
+# 类别编码、count 与航线画像都在 train+test 合并后统计（不用标签，属于转导式，不构成泄漏）；
+# 目标编码一律在折内拟合（见第 2 节）。
+
+# %%
+CAT_COLS = X_raw.select_dtypes(include=["object"]).columns.tolist()
+NUM_COLS = X_raw.select_dtypes(exclude=["object"]).columns.tolist()
+SERVICE_COLS = [
+    "Inflight wifi service", "Departure/Arrival time convenient", "Ease of Online booking", "Gate location",
+    "Food and drink", "Online boarding", "Seat comfort", "Inflight entertainment", "On-board service",
+    "Leg room service", "Baggage handling", "Checkin service", "Cleanliness",
+]
+SEGMENT = ["Type of Travel", "Customer Type", "Class"]
+
+# 公开配置的 4 个组合键；其中 2 个只用来做 TE，TE 之后丢掉
+BASE_COMBOS = [
+    ("Class", "Type of Travel", "Gender"),
+    ("Class", "Type of Travel", "Age"),
+    ("Food and drink", "Cleanliness"),
+    ("Flight Distance", "Departure/Arrival time convenient"),
+]
+BASE_DROP = ["Class_Type of Travel_Age_", "Flight Distance_Departure/Arrival time convenient_"]
+
+# route 变体追加的组合键：航线 ID × 舱位 / 出行类型（高基数，只做 TE），评分 × 乘客分段（保留为类别）
+ROUTE_COMBOS = [
+    ("Flight Distance", "Class"),
+    ("Flight Distance", "Type of Travel"),
+    ("Inflight wifi service", *SEGMENT),
+    ("Online boarding", *SEGMENT),
+    ("Inflight entertainment", *SEGMENT),
+    ("Seat comfort", *SEGMENT),
+]
+ROUTE_DROP = ["Flight Distance_Class_", "Flight Distance_Type of Travel_"]
+ROUTE_PROFILE_COLS = [
+    "Online boarding", "Inflight wifi service", "Seat comfort", "Inflight entertainment", "On-board service",
+    "service_mean",
+]
+
+
+def combo_name(cols) -> str:
+    return "_".join(cols) + "_"
+
+
+def build_features(variant: str) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str]]:
+    """返回 (X, X_test, te_cols, drop_after_te)。"""
+    df = pd.concat([X_raw, X_test_raw], axis=0, ignore_index=True)
+    for c in CAT_COLS:
+        df[c] = df[c].fillna("missing")
+    for c in NUM_COLS:
+        df[c] = df[c].fillna(0.0)
+    out = df.copy()
+
+    # 数值列全部转类别：合成数据的精确取值（尤其 Flight Distance）本身就是信号
+    for c in NUM_COLS:
+        out[f"{c}_cat_"] = pd.Series(pd.factorize(df[c])[0], index=df.index).astype("category")
+    for c in CAT_COLS + ["Leg room service"]:
+        out[f"_{c}_count"] = df[c].map(df[c].value_counts()).astype("int32")
+
+    combos = list(BASE_COMBOS) + (ROUTE_COMBOS if variant == "route" else [])
+    for cols in combos:
+        key = df[cols[0]].astype(str)
+        for c in cols[1:]:
+            key = key + "_" + df[c].astype(str)
+        out[combo_name(cols)] = pd.Series(pd.factorize(key)[0], index=df.index).astype("category")
+
+    if variant == "route":
+        s = df[SERVICE_COLS].to_numpy(dtype=np.float32)
+        df["service_mean"] = s.mean(axis=1)
+        out["_service_mean"] = df["service_mean"]
+        out["_service_std"] = s.std(axis=1)
+        for key_cols, suffix in [(["Flight Distance"], "route"), (["Flight Distance", "Class"], "route_class")]:
+            by = df.groupby(key_cols, observed=True)
+            out[f"_{suffix}_count_log"] = np.log1p(by["service_mean"].transform("size").astype("float32"))
+            for col in ROUTE_PROFILE_COLS:
+                if suffix == "route_class" and col not in ("Online boarding", "service_mean"):
+                    continue
+                mu = by[col].transform("mean").astype("float32")
+                out[f"_{suffix}_{col}_mean"] = mu
+                out[f"_{suffix}_{col}_delta"] = df[col].astype("float32") - mu
+
+    te_cols = [combo_name(c) for c in combos]
+    drop = BASE_DROP + (ROUTE_DROP if variant == "route" else [])
+    return out.iloc[:NTR].reset_index(drop=True), out.iloc[NTR:].reset_index(drop=True), te_cols, drop
+
+
+FEATS = {}
+for v in VARIANTS:
+    t = time.time()
+    FEATS[v] = build_features(v)
+    X, X_te, te_cols, drop = FEATS[v]
+    n_cat = int((X.dtypes == "category").sum())
+    print(f"[{v}] X={X.shape}  categorical={n_cat}  te_cols={len(te_cols)}  drop_after_te={len(drop)}  ({time.time() - t:.0f}s)")
+
+if DRY_RUN:
+    X, X_te, te_cols, drop = FEATS["route"]
+    print(X.dtypes.value_counts().to_string())
+    print("max category cardinality:", max(X[c].cat.categories.size for c in X.columns if X[c].dtype == "category"))
+    assert X.columns.equals(X_te.columns) and not X.drop(columns=te_cols).isna().any().any()
+    raise SystemExit("dry run OK: features built, training skipped")
+
+# %% [markdown]
+# ## 2. RealMLP 训练
+#
+# 超参沿用公开配置（`n_ens=8` 内部集成、3 epoch、不早停）。每折：组合键折内 TE（训练部分用内部 CV），
+# 之后丢掉只为 TE 存在的高基数组合列。
+
+# %%
+os.system("pip install -q pytabkit")
+import torch  # noqa: E402
+from pytabkit import RealMLP_TD_Classifier  # noqa: E402
+
+torch.manual_seed(SEED)
+print("torch", torch.__version__, "cuda", torch.cuda.is_available())
+
+PARAMS = {
+    "random_state": SEED,
+    "verbosity": 0,
+    "val_metric_name": "1-auc_ovr",
+    "n_ens": 8,
+    "n_epochs": 3 if RUN_MODE == "full" else 1,
+    "batch_size": 288,
+    "use_early_stopping": False,
+    "lr": 0.053,
+    "wd": 0.015,
+    "sq_mom": 0.988,
+    "lr_sched": "flat_anneal",
+    "wd_sched": "cos_log_15",
+    "first_layer_lr_factor": 0.25,
+    "embedding_size": 5,
+    "max_one_hot_cat_size": 2,
+    "hidden_sizes": [512, 256, 128],
+    "act": "silu",
+    "p_drop": 0.05,
+    "p_drop_sched": "pow5",
+    "plr_hidden_1": 16,
+    "plr_hidden_2": 8,
+    "plr_act_name": "gelu",
+    "plr_lr_factor": 0.1151,
+    "plr_sigma": 2.33,
+    "ls_eps": 0.01,
+    "ls_eps_sched": "sqrt_cos",
+    "add_front_scale": False,
+    "bias_init_mode": "neg-uniform-dynamic-2",
+    "tfms": ["one_hot", "median_center", "robust_scale", "smooth_clip", "embedding", "l2_normalize"],
+}
+
+folds = list(StratifiedKFold(N_SPLITS, shuffle=True, random_state=SEED).split(np.zeros(NTR), y))
+results = {}
+for v in VARIANTS:
+    X, X_te, te_cols, drop = FEATS[v]
+    oof, pred = np.zeros(NTR), np.zeros(len(X_te))
+    t0 = time.time()
+    for fold, (tr_idx, va_idx) in enumerate(folds, start=1):
+        X_tr, X_va, X_ts = X.iloc[tr_idx].copy(), X.iloc[va_idx].copy(), X_te.copy()
+        enc = TargetEncoder(cv=N_SPLITS, smooth="auto", shuffle=True, random_state=SEED)
+        te_names = [f"_{c}TE" for c in te_cols]
+        X_tr[te_names] = enc.fit_transform(X_tr[te_cols], y.iloc[tr_idx])
+        X_va[te_names] = enc.transform(X_va[te_cols])
+        X_ts[te_names] = enc.transform(X_ts[te_cols])
+        X_tr, X_va, X_ts = (d.drop(columns=drop) for d in (X_tr, X_va, X_ts))
+
+        model = RealMLP_TD_Classifier(**PARAMS)
+        model.fit(X_tr, y.iloc[tr_idx], X_va, y.iloc[va_idx])
+        oof[va_idx] = model.predict_proba(X_va)[:, 1]
+        pred += model.predict_proba(X_ts)[:, 1] / N_SPLITS
+        print(
+            f"[{v}] fold {fold} auc={roc_auc_score(y.iloc[va_idx], oof[va_idx]):.6f}  "
+            f"n_features={X_tr.shape[1]}  ({time.time() - t0:.0f}s)",
+            flush=True,
+        )
+        del model
+        torch.cuda.empty_cache()
+    auc = roc_auc_score(y, oof)
+    results[v] = {"oof_auc": float(auc), "minutes": round((time.time() - t0) / 60, 1)}
+    print(f"[{v}] OOF AUC = {auc:.6f}\n", flush=True)
+    np.save(OUT_DIR / f"oof_realmlp_{v}.npy", oof.astype(np.float32))
+    np.save(OUT_DIR / f"test_realmlp_{v}.npy", pred.astype(np.float32))
+
+# %% [markdown]
+# ## 3. 结果与提交
+#
+# `submission.csv` 取 OOF 更高的变体；两个变体的 OOF / test 都留给堆叠。
+
+# %%
+best = max(results, key=lambda k: results[k]["oof_auc"])
+pred = np.load(OUT_DIR / f"test_realmlp_{best}.npy").astype(float)
+sub = pd.DataFrame({ID: test_id, TARGET: pred})
+assert sub[ID].is_unique and sub[TARGET].between(0, 1).all()
+sub.to_csv(OUT_DIR / "submission.csv", index=False)
+
+if len(VARIANTS) > 1:
+    a, b = (np.load(OUT_DIR / f"oof_realmlp_{v}.npy") for v in VARIANTS)
+    results["oof_rank_corr"] = float(pd.Series(a).corr(pd.Series(b), method="spearman"))
+results["best"] = best
+(OUT_DIR / "metrics.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
+print(json.dumps(results, indent=2))

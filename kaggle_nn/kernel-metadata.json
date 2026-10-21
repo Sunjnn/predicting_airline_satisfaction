@@ -1,0 +1,16 @@
+{
+  "id": "jianansun/s6e10-realmlp-route",
+  "title": "S6E10 RealMLP route",
+  "code_file": "airline_realmlp.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [],
+  "competition_sources": ["playground-series-s6e10"],
+  "kernel_sources": [],
+  "model_sources": []
+}
