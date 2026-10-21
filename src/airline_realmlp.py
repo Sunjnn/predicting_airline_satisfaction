@@ -5,14 +5,17 @@
 # 想继续提分需要不同族的模型。公开的 `yekenot/ps-s6-e10-realmlp-pytabkit`（RealMLP，pytabkit）
 # 单模型 OOF 0.96122，T4 上 9 分钟，是性价比最高的神经网络底座。
 #
-# 本 notebook 同一套 `StratifiedKFold(5, shuffle=True, random_state=42)` 跑两个变体做对照：
+# 本 notebook 同一套 `StratifiedKFold(5, shuffle=True, random_state=42)` 跑若干变体做对照：
 #
-# | 变体 | 特征 |
-# |---|---|
-# | `base` | 复现公开配置：数值列全部转类别（embedding）、count 编码、4 个组合键 + 折内 TE |
-# | `route` | `base` + FE v3 验证过的航线特征：航线画像（精确距离上的评分均值 / 偏差）、航线 × 舱位 / 出行类型与评分 × 乘客分段的折内 TE |
+# | 变体 | 特征 | 模型 | 结果 |
+# |---|---|---|---|
+# | `base` | 复现公开配置：数值列全部转类别（embedding）、count 编码、4 个组合键 + 折内 TE | 公开超参 | v1：OOF 0.961217 / LB 0.96106 |
+# | `route` | `base` + FE v3 的航线画像与航线 / 评分 × 乘客分段 TE | 公开超参 | v1：OOF 0.961179 / LB 0.96106 |
+# | `large` | 同 `base` | 网络加宽一倍（1024-512-256）、6 epoch | v2 |
+# | `seeds3` | 同 `base` | 公开超参 × 3 个 seed 平均（内部集成 8 → 24 个网络） | v2 |
 #
-# 两个变体的 OOF / test 都保存，供堆叠当成员使用。需要 GPU 与联网（`pip install pytabkit`）。
+# v2 只跑 `large` / `seeds3`，验证「更大的模型」是否还有收益。各变体 OOF / test 都保存，供堆叠当成员使用。
+# 需要 GPU 与联网（`pip install pytabkit`）。
 
 # %%
 import json
@@ -37,7 +40,14 @@ SEED = 42
 N_SPLITS = 5
 RUN_MODE = "full"          # "full" | "smoke"
 SMOKE_ROWS = 20_000
-VARIANTS = ["base", "route"]
+# 变体 = 特征集 + 超参覆盖 + seed 列表
+VARIANTS = {
+    "base": {"features": "base", "params": {}, "seeds": [SEED]},
+    "route": {"features": "route", "params": {}, "seeds": [SEED]},
+    "large": {"features": "base", "params": {"hidden_sizes": [1024, 512, 256], "n_epochs": 6}, "seeds": [SEED]},
+    "seeds3": {"features": "base", "params": {}, "seeds": [SEED, SEED + 1, SEED + 2]},
+}
+RUN_VARIANTS = ["large", "seeds3"]
 DRY_RUN = os.environ.get("NN_DRY_RUN") == "1"   # 本地只检查特征工程，不训练
 
 IS_KAGGLE = Path("/kaggle/input").exists()
@@ -116,7 +126,7 @@ def combo_name(cols) -> str:
     return "_".join(cols) + "_"
 
 
-def build_features(variant: str) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str]]:
+def build_features(feature_set: str) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str]]:
     """返回 (X, X_test, te_cols, drop_after_te)。"""
     df = pd.concat([X_raw, X_test_raw], axis=0, ignore_index=True)
     for c in CAT_COLS:
@@ -131,14 +141,14 @@ def build_features(variant: str) -> tuple[pd.DataFrame, pd.DataFrame, list[str],
     for c in CAT_COLS + ["Leg room service"]:
         out[f"_{c}_count"] = df[c].map(df[c].value_counts()).astype("int32")
 
-    combos = list(BASE_COMBOS) + (ROUTE_COMBOS if variant == "route" else [])
+    combos = list(BASE_COMBOS) + (ROUTE_COMBOS if feature_set == "route" else [])
     for cols in combos:
         key = df[cols[0]].astype(str)
         for c in cols[1:]:
             key = key + "_" + df[c].astype(str)
         out[combo_name(cols)] = pd.Series(pd.factorize(key)[0], index=df.index).astype("category")
 
-    if variant == "route":
+    if feature_set == "route":
         s = df[SERVICE_COLS].to_numpy(dtype=np.float32)
         df["service_mean"] = s.mean(axis=1)
         out["_service_mean"] = df["service_mean"]
@@ -154,17 +164,17 @@ def build_features(variant: str) -> tuple[pd.DataFrame, pd.DataFrame, list[str],
                 out[f"_{suffix}_{col}_delta"] = df[col].astype("float32") - mu
 
     te_cols = [combo_name(c) for c in combos]
-    drop = BASE_DROP + (ROUTE_DROP if variant == "route" else [])
+    drop = BASE_DROP + (ROUTE_DROP if feature_set == "route" else [])
     return out.iloc[:NTR].reset_index(drop=True), out.iloc[NTR:].reset_index(drop=True), te_cols, drop
 
 
 FEATS = {}
-for v in VARIANTS:
+for fs in sorted({VARIANTS[v]["features"] for v in RUN_VARIANTS} | ({"route"} if DRY_RUN else set())):
     t = time.time()
-    FEATS[v] = build_features(v)
-    X, X_te, te_cols, drop = FEATS[v]
+    FEATS[fs] = build_features(fs)
+    X, X_te, te_cols, drop = FEATS[fs]
     n_cat = int((X.dtypes == "category").sum())
-    print(f"[{v}] X={X.shape}  categorical={n_cat}  te_cols={len(te_cols)}  drop_after_te={len(drop)}  ({time.time() - t:.0f}s)")
+    print(f"[{fs}] X={X.shape}  categorical={n_cat}  te_cols={len(te_cols)}  drop_after_te={len(drop)}  ({time.time() - t:.0f}s)")
 
 if DRY_RUN:
     X, X_te, te_cols, drop = FEATS["route"]
@@ -221,8 +231,9 @@ PARAMS = {
 
 folds = list(StratifiedKFold(N_SPLITS, shuffle=True, random_state=SEED).split(np.zeros(NTR), y))
 results = {}
-for v in VARIANTS:
-    X, X_te, te_cols, drop = FEATS[v]
+for v in RUN_VARIANTS:
+    cfg = VARIANTS[v]
+    X, X_te, te_cols, drop = FEATS[cfg["features"]]
     oof, pred = np.zeros(NTR), np.zeros(len(X_te))
     t0 = time.time()
     for fold, (tr_idx, va_idx) in enumerate(folds, start=1):
@@ -234,17 +245,19 @@ for v in VARIANTS:
         X_ts[te_names] = enc.transform(X_ts[te_cols])
         X_tr, X_va, X_ts = (d.drop(columns=drop) for d in (X_tr, X_va, X_ts))
 
-        model = RealMLP_TD_Classifier(**PARAMS)
-        model.fit(X_tr, y.iloc[tr_idx], X_va, y.iloc[va_idx])
-        oof[va_idx] = model.predict_proba(X_va)[:, 1]
-        pred += model.predict_proba(X_ts)[:, 1] / N_SPLITS
+        # 多个 seed 时各训一个模型，概率取平均
+        for sd in cfg["seeds"]:
+            model = RealMLP_TD_Classifier(**{**PARAMS, **cfg["params"], "random_state": sd})
+            model.fit(X_tr, y.iloc[tr_idx], X_va, y.iloc[va_idx])
+            oof[va_idx] += model.predict_proba(X_va)[:, 1] / len(cfg["seeds"])
+            pred += model.predict_proba(X_ts)[:, 1] / (N_SPLITS * len(cfg["seeds"]))
+            del model
+            torch.cuda.empty_cache()
         print(
             f"[{v}] fold {fold} auc={roc_auc_score(y.iloc[va_idx], oof[va_idx]):.6f}  "
             f"n_features={X_tr.shape[1]}  ({time.time() - t0:.0f}s)",
             flush=True,
         )
-        del model
-        torch.cuda.empty_cache()
     auc = roc_auc_score(y, oof)
     results[v] = {"oof_auc": float(auc), "minutes": round((time.time() - t0) / 60, 1)}
     print(f"[{v}] OOF AUC = {auc:.6f}\n", flush=True)
@@ -254,7 +267,7 @@ for v in VARIANTS:
 # %% [markdown]
 # ## 3. 结果与提交
 #
-# `submission.csv` 取 OOF 更高的变体；两个变体的 OOF / test 都留给堆叠。
+# `submission.csv` 取 OOF 最高的变体；各变体的 OOF / test 都留给堆叠。
 
 # %%
 best = max(results, key=lambda k: results[k]["oof_auc"])
@@ -263,8 +276,8 @@ sub = pd.DataFrame({ID: test_id, TARGET: pred})
 assert sub[ID].is_unique and sub[TARGET].between(0, 1).all()
 sub.to_csv(OUT_DIR / "submission.csv", index=False)
 
-if len(VARIANTS) > 1:
-    a, b = (np.load(OUT_DIR / f"oof_realmlp_{v}.npy") for v in VARIANTS)
+if len(RUN_VARIANTS) == 2:
+    a, b = (np.load(OUT_DIR / f"oof_realmlp_{v}.npy") for v in RUN_VARIANTS)
     results["oof_rank_corr"] = float(pd.Series(a).corr(pd.Series(b), method="spearman"))
 results["best"] = best
 (OUT_DIR / "metrics.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
