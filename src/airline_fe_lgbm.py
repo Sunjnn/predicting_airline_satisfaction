@@ -11,6 +11,8 @@
 # | 原始数据集训练的模型预测值作为特征 | 同上 | — |
 # | 服务评分聚合（均值/离散度/极值/0 与 5 计数） | 本仓库主线模型 | — |
 # | 原始数据按精确键元组查 target rate + 支持度 | 同上（升级版） | — |
+# | 航线画像：精确距离（× 舱位）上的评分均值与个人偏差 | `kozykappa/s6e10-route-profile-cross-fitted-target` | — |
+# | 航线 ID / 评分 × 乘客分段的折内目标编码 | 同上 | — |
 #
 # 单一 LightGBM、5 折，不做融合，方便干净地读出「特征」本身的收益。
 
@@ -166,6 +168,40 @@ for col in FREQ_COLS:
 print(f"freq/rarity columns: {2 * len(FREQ_COLS)}  -> train={train.shape}")
 
 # %% [markdown]
+# ## 航线画像（route profile）
+#
+# 公开方案（`kozykappa/s6e10-route-profile-cross-fitted-target`、`kratosyan` 的 route-ID 系列）发现：
+# 合成数据里**精确的 `Flight Distance` 近似一条航线 ID**。同一距离（及距离 × 舱位）下，
+# 关键评分的均值描述了「这条航线通常的服务水平」，个人评分减去航线均值则是「相对体验」。
+# 只用特征、不用标签，train+test 合并统计。
+
+# %%
+ROUTE_COLS = [
+    "Online boarding",
+    "Inflight wifi service",
+    "Seat comfort",
+    "Inflight entertainment",
+    "On-board service",
+    "service_mean",
+]
+_all = pd.concat([train, test], axis=0, ignore_index=True)
+for key_cols, suffix in [(["Flight Distance"], "route"), (["Flight Distance", "Class"], "route_class")]:
+    by = _all.groupby(key_cols, observed=True, dropna=False)
+    cnt = by["service_mean"].transform("size").astype("float32").to_numpy()
+    feats = {f"{suffix}_count_log": np.log1p(cnt)}
+    for col in ROUTE_COLS:
+        if suffix == "route_class" and col not in ("Online boarding", "service_mean"):
+            continue
+        mu = by[col].transform("mean").astype("float32").to_numpy()
+        feats[f"{suffix}_{col}_mean"] = mu
+        feats[f"{suffix}_{col}_delta"] = _all[col].to_numpy(dtype="float32") - mu
+    for name, v in feats.items():
+        train[name] = v[: len(train)].astype("float32")
+        test[name] = v[len(train):].astype("float32")
+del _all
+print(f"route profile added -> train={train.shape}")
+
+# %% [markdown]
 # ## 4. 目标编码的键
 #
 # 除了 4 个原始类别列，还构造分箱键（年龄/距离/延误）与交叉键。目标编码本身在每折内拟合，
@@ -188,6 +224,22 @@ def add_keys(df: pd.DataFrame) -> pd.DataFrame:
     out["gender_class"] = out["Gender"].astype(str) + "_" + out["Class"].astype(str)
     out["class_board"] = out["Class"].astype(str) + "_" + out["Online boarding"].astype(str)
     out["distance_travel"] = out["distance_500"].astype(str) + "_" + out["Type of Travel"].astype(str)
+    # 航线 ID 与「关键评分 × 乘客分段」的条件键（route-profile 方案）
+    segment = (
+        out["Type of Travel"].astype(str) + "_" + out["Customer Type"].astype(str) + "_" + out["Class"].astype(str)
+    )
+    out["passenger_segment"] = segment
+    out["route_id"] = out["Flight Distance"].astype("int32")
+    out["route_class"] = out["Flight Distance"].astype(str) + "_" + out["Class"].astype(str)
+    out["route_travel"] = out["Flight Distance"].astype(str) + "_" + out["Type of Travel"].astype(str)
+    for col, short in [
+        ("Online boarding", "boarding"),
+        ("Inflight wifi service", "wifi"),
+        ("Inflight entertainment", "entertainment"),
+        ("Seat comfort", "seat"),
+    ]:
+        out[f"{short}_segment"] = out[col].astype(str) + "_" + segment
+    out["age_segment"] = out["age_5"].astype(str) + "_" + segment
     return out
 
 
@@ -212,6 +264,15 @@ TE_COLS = [
     "gender_class",
     "class_board",
     "distance_travel",
+    "passenger_segment",
+    "route_id",
+    "route_class",
+    "route_travel",
+    "boarding_segment",
+    "wifi_segment",
+    "entertainment_segment",
+    "seat_segment",
+    "age_segment",
 ]
 SMOOTHINGS = [("auto", "auto"), ("s10", 10.0), ("s100", 100.0)]
 print(f"TE keys: {len(TE_COLS)} x smoothings {len(SMOOTHINGS)} = {len(TE_COLS) * len(SMOOTHINGS)} features")
