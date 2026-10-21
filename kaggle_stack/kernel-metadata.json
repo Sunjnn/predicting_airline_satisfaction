@@ -10,15 +10,38 @@
   "enable_internet": false,
   "machine_shape": "",
   "dataset_sources": [
+    "cdeotte/s6e10-124-public-oof-and-test-predictions",
     "cdeotte/s6e10-tfm-oof-and-test-predictions",
-    "megayak/s6e10-oof-library",
-    "sachith7/s6e10-stack-oof-predictions",
     "dariushafshar/s6e10-golem-oof-library",
-    "arhancanli12/s6e10-oof-test-predictions",
+    "abdullahsafwan333/oof-dataset",
+    "sadamtorres/ps-s6e10-airline-satisfaction-artifacts",
+    "amanatar/s6e10-forge-own-pairs",
+    "sachith7/s6e10-stack-oof-predictions",
+    "koumeimaki/s6e10-route-tfm-nn-oof",
     "goodpjw2008/s6e10-tabpfn-member",
-    "dmitriykolmikov/s6e10-catboost-all-categorical-oof-and-test"
+    "goodpjw2008/s6e10-goodpjw2008-extra-members-oof",
+    "dmitriykolmikov/s6e10-catboost-all-categorical-oof-and-test",
+    "kagankoral/s6e10-ablation-members-oof",
+    "megayak/s6e10-oof-library",
+    "arhancanli12/s6e10-oof-test-predictions",
+    "kratosyan/s6e10-busyaprime-five-members-oof"
   ],
   "competition_sources": ["playground-series-s6e10"],
-  "kernel_sources": [],
+  "kernel_sources": [
+    "yekenot/ps-s6-e10-realmlp-pytabkit",
+    "hermengardo/single-catboost-eda-ps6e10",
+    "kratosyan/s6e10-xgboost-realmlp-route-id-teacher",
+    "kagankoral/s6e10-encodings-catboost-realmlp-lb-0-961",
+    "amanatar/s6e10-the-original-prior-stack-v5",
+    "samanyu1808/s6e10-tabpfn-route-og",
+    "samanyu1808/s6e10-tabpfn-seeds",
+    "hemingweb/s6e10-exp01-tabpfn35-full-context",
+    "mitudru/s6e10-analysis-first-equality-blocks-stack",
+    "wangxintong111/s6e10-catboost-rating-crosses-cv-0-96080",
+    "wangxintong111/s6e10-lightgbm-context-stats-cv-0-96065",
+    "thisray/s6e10-xgb-realmlp-catboost-lb-0-96123",
+    "megayak/s6e10-honest-oof-stack",
+    "jianansun/s6e10-fe-lightgbm"
+  ],
   "model_sources": []
 }
