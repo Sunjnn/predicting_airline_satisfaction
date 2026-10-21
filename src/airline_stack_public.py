@@ -11,7 +11,7 @@
 # | family-wise L2：TabPFN 列 ×3、其他基础模型 ×1.5（等于把它们的 L2 惩罚除以 9 / 2.25） | `goodpjw2008` Part 11 / `ewtherka` | +0.00001~2 |
 # | 0.8 × LR + 0.2 × LightGBM 二级模型（各自标准化） | `yeashusemwal/trust-the-cv` | +0.00001 |
 # | **排除 stack/blend 级成员**：已在全量标签上拟合过的堆叠结果会让嵌套 CV 虚高 | `ewtherka` 的完全嵌套复核 | — |
-# | 自建成员：`jianansun/s6e10-fe-lightgbm`（FE + 航线画像 LightGBM，同一套 5 折） | 本仓库 | — |
+# | 自建成员：`jianansun/s6e10-fe-lightgbm`（FE + 航线画像 LightGBM）、`jianansun/s6e10-realmlp-route`（RealMLP base / route），同一套 5 折 | 本仓库 | — |
 #
 # 二级模型统一在 `StratifiedKFold(5, shuffle=True, random_state=42)` 上做嵌套 CV（多数成员也用这套折）。
 # 非基线配置只有在 5 折里至少 4 折胜过基线时才采用。
@@ -309,6 +309,12 @@ def load_own_fe(d):
     yield "own_fe_lgbm", np.load(first(d, "fe_oof.npy")), np.load(first(d, "fe_test_pred.npy"))
 
 
+# ---- 自建成员：RealMLP（base / route 两个变体，同一套 seed-42 5 折）
+@source("own_nn", "s6e10-realmlp-route")
+def load_own_nn(d):
+    yield from npy_pairs(d, "own_nn_", "oof_realmlp_*.npy")
+
+
 print(f"{len(SOURCES)} sources registered")
 
 # %% [markdown]
@@ -514,13 +520,19 @@ for sch, C in LR_SETTINGS:
         flush=True,
     )
 
-# 自建成员的边际贡献：去掉它们后跑一次基线
-own_delta = None
+# 自建成员的边际贡献：全部去掉跑一次基线；多于一个时再逐个去掉（leave-one-out）
+own_delta, own_each = None, {}
 if OWN:
     keep_cols = [i for i in range(Z.shape[1]) if i not in OWN]
     no_own = fold_auc(nested_lr(Z[:, keep_cols], BASELINE[2]))
     own_delta = float((RES[BASELINE] - no_own).mean())
     print(f"baseline without own members: {no_own.mean():.6f}  -> own members add {own_delta * 1e6:+.1f} x 1e-6")
+    if len(OWN) > 1:
+        for i in OWN:
+            loo = fold_auc(nested_lr(Z[:, [j for j in range(Z.shape[1]) if j != i]], BASELINE[2]))
+            d = RES[BASELINE] - loo
+            own_each[NAMES[i]] = float(d.mean())
+            print(f"  without {NAMES[i]:<24} -> it adds {d.mean() * 1e6:+.1f} x 1e-6  ({int((d > 0).sum())}/5 folds up)")
 
 # %% [markdown]
 # ## 4. 选择
@@ -576,6 +588,7 @@ metrics = {
     "n_members": len(NAMES),
     "families": {f: int((FAM == f).sum()) for f in ("gbdt", "mlp", "tabpfn", "tfm")},
     "own_members_gain": own_delta,
+    "own_member_gain_each": own_each,
     "minutes": round((time.time() - T0) / 60, 1),
 }
 (open(f"{OUT}/metrics.json", "w")).write(json.dumps(metrics, indent=2))

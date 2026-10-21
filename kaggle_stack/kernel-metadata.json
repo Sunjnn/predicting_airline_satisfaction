@@ -26,7 +26,9 @@
     "arhancanli12/s6e10-oof-test-predictions",
     "kratosyan/s6e10-busyaprime-five-members-oof"
   ],
-  "competition_sources": ["playground-series-s6e10"],
+  "competition_sources": [
+    "playground-series-s6e10"
+  ],
   "kernel_sources": [
     "yekenot/ps-s6-e10-realmlp-pytabkit",
     "hermengardo/single-catboost-eda-ps6e10",
@@ -41,7 +43,8 @@
     "wangxintong111/s6e10-lightgbm-context-stats-cv-0-96065",
     "thisray/s6e10-xgb-realmlp-catboost-lb-0-96123",
     "megayak/s6e10-honest-oof-stack",
-    "jianansun/s6e10-fe-lightgbm"
+    "jianansun/s6e10-fe-lightgbm",
+    "jianansun/s6e10-realmlp-route"
   ],
   "model_sources": []
 }
