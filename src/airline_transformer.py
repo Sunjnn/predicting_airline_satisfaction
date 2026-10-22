@@ -21,6 +21,11 @@
 # 侧特征和摘要都不用比赛标签（只用特征，或原始数据集自己的标签），所以只算一次，不必放进 CV 折内。
 #
 # 模型：3 层 pre-norm Transformer encoder（d=96，4 头），读 CLS 输出做二分类。固定 epoch 数，不在验证折上早停。
+#
+# | 版本 | epoch | OOF AUC | 备注 |
+# |---|---|---|---|
+# | v1 | 6 | 0.959915 | 第 3 个 epoch 验证 AUC 见顶（fold 1：0.96074），之后下降到 0.95993 |
+# | v2 | 3 | — | cosine 在 3 个 epoch 内走完 |
 
 # %%
 import json
@@ -232,7 +237,7 @@ import torch.nn as nn  # noqa: E402
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 D, HEADS, LAYERS, FF, DROP = 96, 4, 3, 192, 0.1
 N_FREQ = 16
-EPOCHS = 6 if RUN_MODE == "full" else 2
+EPOCHS = 3 if RUN_MODE == "full" else 2   # v1 用 6：验证 AUC 在第 3 个 epoch 见顶后下降（航线 embedding 过拟合）
 BATCH = 1024
 LR, WD = 1e-3, 1e-2
 
