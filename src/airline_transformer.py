@@ -261,7 +261,7 @@ class RowTokenizer(nn.Module):
         ang = 2 * math.pi * num_b.unsqueeze(-1) * self.freq                     # (B, 4, F)
         per = torch.cat([torch.sin(ang), torch.cos(ang)], -1)                   # (B, 4, 2F)
         num_tok = torch.einsum("bnf,nfd->bnd", per, self.num_w)
-        tok = tok.index_add(1, self.num_idx, num_tok)
+        tok = tok.index_add(1, self.num_idx, num_tok.to(tok.dtype))   # autocast 下 einsum 输出是半精度
         summary = torch.stack([self.stats_proj(stats_b), self.prior_proj(prior_b)], 1)   # (B, 2, D)
         x = torch.cat([self.cls.expand(len(tok), -1, -1), tok, summary], 1)            # (B, 24, D)
         return self.norm(x)
