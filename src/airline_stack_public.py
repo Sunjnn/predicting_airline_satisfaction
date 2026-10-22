@@ -11,7 +11,7 @@
 # | family-wise L2：TabPFN 列 ×3、其他基础模型 ×1.5（等于把它们的 L2 惩罚除以 9 / 2.25） | `goodpjw2008` Part 11 / `ewtherka` | +0.00001~2 |
 # | 0.8 × LR + 0.2 × LightGBM 二级模型（各自标准化） | `yeashusemwal/trust-the-cv` | +0.00001 |
 # | **排除 stack/blend 级成员**：已在全量标签上拟合过的堆叠结果会让嵌套 CV 虚高 | `ewtherka` 的完全嵌套复核 | — |
-# | 自建成员：`jianansun/s6e10-fe-lightgbm`（FE + 航线画像 LightGBM）、`jianansun/s6e10-realmlp-route`（RealMLP base / route），同一套 5 折 | 本仓库 | — |
+# | 自建成员：`jianansun/s6e10-fe-lightgbm`（FE + 航线画像 LightGBM）、`jianansun/s6e10-realmlp-route`（RealMLP）、`jianansun/s6e10-small-transformer`（小型 Transformer），同一套 5 折 | 本仓库 | — |
 #
 # 二级模型统一在 `StratifiedKFold(5, shuffle=True, random_state=42)` 上做嵌套 CV（多数成员也用这套折）。
 # 非基线配置只有在 5 折里至少 4 折胜过基线时才采用。
@@ -313,6 +313,12 @@ def load_own_fe(d):
 @source("own_nn", "s6e10-realmlp-route")
 def load_own_nn(d):
     yield from npy_pairs(d, "own_nn_", "oof_realmlp_*.npy")
+
+
+# ---- 自建成员：小型 Transformer（每列一个 token，同一套 seed-42 5 折；输出是 logit）
+@source("own_tr", "s6e10-small-transformer")
+def load_own_tr(d):
+    yield from npy_pairs(d, "own_tr_", "oof_transformer.npy")
 
 
 print(f"{len(SOURCES)} sources registered")

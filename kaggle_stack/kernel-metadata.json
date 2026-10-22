@@ -44,7 +44,8 @@
     "thisray/s6e10-xgb-realmlp-catboost-lb-0-96123",
     "megayak/s6e10-honest-oof-stack",
     "jianansun/s6e10-fe-lightgbm",
-    "jianansun/s6e10-realmlp-route"
+    "jianansun/s6e10-realmlp-route",
+    "jianansun/s6e10-small-transformer"
   ],
   "model_sources": []
 }
